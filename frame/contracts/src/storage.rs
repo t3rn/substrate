@@ -17,6 +17,8 @@
 
 //! This module contains routines for accessing and altering a contract related state.
 
+pub mod meter;
+
 use crate::{
 	exec::{AccountIdOf, StorageKey},
 	weights::WeightInfo,
@@ -79,7 +81,7 @@ where
 	/// The read is performed from the `trie_id` only. The `address` is not necessary. If the
 	/// contract doesn't store under the given `key` `None` is returned.
 	pub fn read(trie_id: &TrieId, key: &StorageKey) -> Option<Vec<u8>> {
-		child::get_raw(&child_trie_info(&trie_id), &blake2_256(key))
+		child::get_raw(&child_trie_info(trie_id), &blake2_256(key))
 	}
 
 	/// Update a storage entry into a contract's kv storage.
@@ -90,15 +92,38 @@ where
 	/// contract owns, the last block the storage was written to, etc. That's why, in contrast to
 	/// `read`, this function also requires the `account` ID.
 	pub fn write(
-		new_info: &mut ContractInfo<T>,
+		trie_id: &TrieId,
 		key: &StorageKey,
-		opt_new_value: Option<Vec<u8>>,
+		new_value: Option<Vec<u8>>,
+		storage_meter: &mut meter::NestedMeter<T>,
 	) -> DispatchResult {
 		let hashed_key = blake2_256(key);
-		let child_trie_info = &child_trie_info(&new_info.trie_id);
+		let child_trie_info = &child_trie_info(trie_id);
+		let mut diff = meter::Diff::default();
+		let old_len = child::len(&child_trie_info, &hashed_key);
 
-		match opt_new_value {
-			Some(new_value) => child::put_raw(&child_trie_info, &hashed_key, &new_value[..]),
+		match (old_len, new_value.as_ref().map(|v| v.len() as u32)) {
+			(Some(old_len), Some(new_len)) =>
+				if new_len > old_len {
+					diff.bytes_added = new_len - old_len;
+				} else {
+					diff.bytes_removed = old_len - new_len;
+				},
+			(None, Some(new_len)) => {
+				diff.bytes_added = new_len;
+				diff.items_added = 1;
+			},
+			(Some(old_len), None) => {
+				diff.bytes_removed = old_len;
+				diff.items_removed = 1;
+			},
+			(None, None) => (),
+		}
+
+		storage_meter.charge(&diff)?;
+
+		match &new_value {
+			Some(new_value) => child::put_raw(&child_trie_info, &hashed_key, new_value),
 			None => child::kill(&child_trie_info, &hashed_key),
 		}
 

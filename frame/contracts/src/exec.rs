@@ -16,11 +16,14 @@
 // limitations under the License.
 
 use crate::{
-	gas::GasMeter, storage::Storage, AccountCounter, BalanceOf, CodeHash, Config, ContractInfo,
-	ContractInfoOf, Error, Event, Pallet as Contracts, Schedule,
+	gas::GasMeter,
+	storage::{self, Storage},
+	AccountCounter, BalanceOf, CodeHash, Config, ContractInfo, ContractInfoOf, Error, Event,
+	Pallet as Contracts, Schedule,
 };
 use frame_support::{
 	dispatch::{DispatchError, DispatchResult, DispatchResultWithPostInfo, Dispatchable},
+	pallet_prelude::Encode,
 	storage::{with_transaction, TransactionOutcome},
 	traits::{Contains, Currency, ExistenceRequirement, Get, OriginTrait, Randomness, Time},
 	weights::Weight,
@@ -310,6 +313,8 @@ pub struct Stack<'a, T: Config, E> {
 	schedule: &'a Schedule<T>,
 	/// The gas meter where costs are charged to.
 	gas_meter: &'a mut GasMeter<T>,
+	/// The storage meter makes sure that the storage limit is obeyed.
+	storage_meter: &'a mut storage::meter::Meter<T>,
 	/// The timestamp at the point of call stack instantiation.
 	timestamp: MomentOf<T>,
 	/// The block number at the time of call stack instantiation.
@@ -350,7 +355,9 @@ pub struct Frame<T: Config> {
 	/// Determines whether this is a call or instantiate frame.
 	entry_point: ExportedFunction,
 	/// The gas meter capped to the supplied gas limit.
-	nested_meter: GasMeter<T>,
+	nested_gas: GasMeter<T>,
+	/// The storage meter for the individual call.
+	nested_storage: storage::meter::NestedMeter<T>,
 	/// If `false` the contract enabled its defense against reentrance attacks.
 	allows_reentry: bool,
 }
@@ -472,6 +479,7 @@ where
 		origin: T::AccountId,
 		dest: T::AccountId,
 		gas_meter: &'a mut GasMeter<T>,
+		storage_meter: &'a mut storage::meter::Meter<T>,
 		schedule: &'a Schedule<T>,
 		value: BalanceOf<T>,
 		input_data: Vec<u8>,
@@ -481,6 +489,7 @@ where
 			FrameArgs::Call { dest, cached_info: None },
 			origin,
 			gas_meter,
+			storage_meter,
 			schedule,
 			value,
 			debug_message,
@@ -502,6 +511,7 @@ where
 		origin: T::AccountId,
 		executable: E,
 		gas_meter: &'a mut GasMeter<T>,
+		storage_meter: &'a mut storage::meter::Meter<T>,
 		schedule: &'a Schedule<T>,
 		value: BalanceOf<T>,
 		input_data: Vec<u8>,
@@ -517,6 +527,7 @@ where
 			},
 			origin,
 			gas_meter,
+			storage_meter,
 			schedule,
 			value,
 			debug_message,
@@ -530,15 +541,18 @@ where
 		args: FrameArgs<T, E>,
 		origin: T::AccountId,
 		gas_meter: &'a mut GasMeter<T>,
+		storage_meter: &'a mut storage::meter::Meter<T>,
 		schedule: &'a Schedule<T>,
 		value: BalanceOf<T>,
 		debug_message: Option<&'a mut Vec<u8>>,
 	) -> Result<(Self, E), ExecError> {
-		let (first_frame, executable) = Self::new_frame(args, value, gas_meter, 0, &schedule)?;
+		let (first_frame, executable) =
+			Self::new_frame(args, value, gas_meter, storage_meter, 0, &schedule)?;
 		let stack = Self {
 			origin,
 			schedule,
 			gas_meter,
+			storage_meter,
 			timestamp: T::Time::now(),
 			block_number: <frame_system::Pallet<T>>::block_number(),
 			account_counter: None,
@@ -555,13 +569,15 @@ where
 	///
 	/// This does not take `self` because when constructing the first frame `self` is
 	/// not initialized, yet.
-	fn new_frame(
+	fn new_frame<S: storage::meter::State>(
 		frame_args: FrameArgs<T, E>,
 		value_transferred: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
+		storage_meter: &mut storage::meter::GenericMeter<T, S>,
 		gas_limit: Weight,
 		schedule: &Schedule<T>,
 	) -> Result<(Frame<T>, E), ExecError> {
+		let mut nested_storage = storage_meter.nested();
 		let (account_id, contract_info, executable, entry_point) = match frame_args {
 			FrameArgs::Call { dest, cached_info } => {
 				let contract = if let Some(contract) = cached_info {
@@ -583,6 +599,11 @@ where
 					trie_id,
 					executable.code_hash().clone(),
 				)?;
+				nested_storage.charge(&storage::meter::Diff {
+					bytes_added: contract.encoded_size() as u32,
+					items_added: 1,
+					..Default::default()
+				})?;
 				(account_id, contract, executable, ExportedFunction::Constructor)
 			},
 		};
@@ -592,7 +613,8 @@ where
 			contract_info: CachedContract::Cached(contract_info),
 			account_id,
 			entry_point,
-			nested_meter: gas_meter.nested(gas_limit)?,
+			nested_gas: gas_meter.nested(gas_limit)?,
+			nested_storage,
 			allows_reentry: true,
 		};
 
@@ -623,10 +645,17 @@ where
 			}
 		}
 
-		let nested_meter =
-			&mut self.frames.last_mut().unwrap_or(&mut self.first_frame).nested_meter;
-		let (frame, executable) =
-			Self::new_frame(frame_args, value_transferred, nested_meter, gas_limit, self.schedule)?;
+		let frame = self.frames.last_mut().unwrap_or(&mut self.first_frame);
+		let nested_gas = &mut frame.nested_gas;
+		let nested_storage = &mut frame.nested_storage;
+		let (frame, executable) = Self::new_frame(
+			frame_args,
+			value_transferred,
+			nested_gas,
+			nested_storage,
+			gas_limit,
+			self.schedule,
+		)?;
 		self.frames.push(frame);
 		Ok(executable)
 	}
@@ -694,14 +723,17 @@ where
 		let frame = self.frames.pop();
 
 		if let Some(frame) = frame {
-			let prev = self.top_frame_mut();
 			let account_id = &frame.account_id;
-			prev.nested_meter.absorb_nested(frame.nested_meter);
+			self.top_frame_mut().nested_gas.absorb_nested(frame.nested_gas);
 			// Only gas counter changes are persisted in case of a failure.
 			if !persist {
 				return
 			}
+			// absorb on persist, drop on failure
+			self.absorb_storage_meter(frame.nested_storage, account_id);
 			if let CachedContract::Cached(contract) = frame.contract_info {
+				let prev = self.top_frame_mut();
+
 				// optimization: Predecessor is the same contract.
 				// We can just copy the contract into the predecessor without a storage write.
 				// This is possible when there is no other contract in-between that could
@@ -730,11 +762,17 @@ where
 				);
 			}
 			// Write back to the root gas meter.
-			self.gas_meter.absorb_nested(mem::take(&mut self.first_frame.nested_meter));
+			self.gas_meter.absorb_nested(mem::take(&mut self.first_frame.nested_gas));
 			// Only gas counter changes are persisted in case of a failure.
 			if !persist {
 				return
 			}
+			// absorb on persist, drop on failure
+			self.storage_meter.absorb(
+				&mut self.first_frame.nested_storage,
+				&self.origin,
+				&self.first_frame.account_id,
+			);
 			if let CachedContract::Cached(contract) = &self.first_frame.contract_info {
 				<ContractInfoOf<T>>::insert(&self.first_frame.account_id, contract);
 			}
@@ -787,6 +825,16 @@ where
 	/// Mutable reference to the current (top) frame.
 	fn top_frame_mut(&mut self) -> &mut Frame<T> {
 		self.frames.last_mut().unwrap_or(&mut self.first_frame)
+	}
+
+	/// Absorb the passed storage meter into the current (top) frame.
+	fn absorb_storage_meter(
+		&mut self,
+		mut meter: storage::meter::NestedMeter<T>,
+		contract: &T::AccountId,
+	) {
+		let prev = self.frames.last_mut().unwrap_or(&mut self.first_frame);
+		prev.nested_storage.absorb(&mut meter, &self.origin, contract);
 	}
 
 	/// Iterator over all frames.
@@ -916,7 +964,7 @@ where
 			T::Currency::free_balance(&frame.account_id),
 		)?;
 		ContractInfoOf::<T>::remove(&frame.account_id);
-		E::remove_user(info.code_hash, &mut frame.nested_meter)?;
+		E::remove_user(info.code_hash, &mut frame.nested_gas)?;
 		Contracts::<T>::deposit_event(Event::Terminated(
 			frame.account_id.clone(),
 			beneficiary.clone(),
@@ -934,7 +982,12 @@ where
 
 	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult {
 		let frame = self.top_frame_mut();
-		Storage::<T>::write(frame.contract_info(), &key, value)
+		Storage::<T>::write(
+			&frame.contract_info.get(&frame.account_id).trie_id,
+			&key,
+			value,
+			&mut frame.nested_storage,
+		)
 	}
 
 	fn address(&self) -> &T::AccountId {
@@ -989,7 +1042,7 @@ where
 	}
 
 	fn gas_meter(&mut self) -> &mut GasMeter<Self::T> {
-		&mut self.top_frame_mut().nested_meter
+		&mut self.top_frame_mut().nested_gas
 	}
 
 	fn append_debug_buffer(&mut self, msg: &str) -> bool {
