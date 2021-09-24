@@ -670,7 +670,7 @@ build-rustdoc:
     - '[[ " ${RUSTDOCS_DEPLOY_REFS} " =~ " ${CI_COMMIT_REF_NAME} " ]] || exit 0'
     # FIXME: it fails with `RUSTDOCFLAGS="-Dwarnings"`
     - RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html"
-        time cargo +nightly doc --no-deps --workspace --all-features --verbose
+        time cargo doc --no-deps --workspace --all-features --verbose
     - rm -f ./target/doc/.lock
     - mv ./target/doc ./crate-docs
     # FIXME: remove me after CI image gets nonroot
@@ -700,7 +700,7 @@ rebuild-all-rustdoc:
     - for REF in "${DEPLOY_ARR[@]}"; do
         git checkout $REF || (echo "${REF} not existed in remote." && continue);
         RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html"
-          time cargo +nightly doc --no-deps --workspace --all-features --verbose;
+          time cargo doc --no-deps --workspace --all-features --verbose;
         rm -f ./target/doc/.lock;
         mv target/doc crate-docs/${REF};
         echo "<meta http-equiv=refresh content=0;url=${DOC_INDEX_PAGE}>" > ./crate-docs/${REF}/index.html;
