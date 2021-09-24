@@ -49,7 +49,7 @@ variables:                         &default-vars
 .gen-rustdoc-vars:                 &gen-rustdoc-vars
   DOC_INDEX_PAGE:                  "sc_service/index.html" # default redirected page
   # Space separated values of branches and tags to generate rustdocs
-  RUSTDOCS_DEPLOY_REFS:            "master monthly-2021-09+1 monthly-2021-08 v3.0.0"
+  RUSTDOCS_DEPLOY_REFS:            "master monthly-2021-09+1 monthly-2021-08 monthly-2021-03"
   # Location of the docs index template
   INDEX_TPL:                       ".maintain/docs-index-tpl.ejs"
   # Where the `/latest` symbolic link links to. One of the $RUSTDOCS_DEPLOY_REFS value.
@@ -703,9 +703,9 @@ rebuild-all-rustdoc:
           time cargo +nightly doc --no-deps --workspace --all-features --verbose;
         rm -f ./target/doc/.lock;
         mv target/doc crate-docs/${REF};
-        chown -R nonroot:nonroot ./crate-docs/${REF};
         echo "<meta http-equiv=refresh content=0;url=${DOC_INDEX_PAGE}>" > ./crate-docs/${REF}/index.html;
       done
+    - chown -R nonroot:nonroot ./crate-docs
     - sccache -s
   after_script:
     - rm -rf .git/
