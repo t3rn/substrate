@@ -161,6 +161,7 @@ default:
 
 .gen-rustdoc-rules:                &gen-rustdoc-rules
   rules:
+    - if: $CI_COMMIT_REF_NAME =~ /^[0-9]+$/
     - if: $CI_PIPELINE_SOURCE == "pipeline"
       when: never
     - if: $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_REF_NAME == "master"
@@ -171,6 +172,7 @@ default:
 .regen-all-rustdoc-rules:          &regen-all-rustdoc-rules
   rules:
     # Will only run if manually triggered on web with $REPUBLISH_ALL_RUSTDOCS set to true
+    - if: $CI_COMMIT_REF_NAME =~ /^[0-9]+$/
     - if: $CI_PIPELINE_SOURCE == "web" && $REPUBLISH_ALL_RUSTDOCS == "true"
 
 .merge-ref-into-master-script:     &merge-ref-into-master-script
