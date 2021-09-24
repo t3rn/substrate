@@ -49,7 +49,7 @@ variables:                         &default-vars
 .gen-rustdoc-vars:                 &gen-rustdoc-vars
   DOC_INDEX_PAGE:                  "sc_service/index.html" # default redirected page
   # Space separated values of branches and tags to generate rustdocs
-  RUSTDOCS_DEPLOY_REFS:            "master monthly-2021-09+1 monthly-2021-08 monthly-2021-03"
+  RUSTDOCS_DEPLOY_REFS:            "master monthly-2021-09+1 monthly-2021-08 v3.0.0"
   # Location of the docs index template
   INDEX_TPL:                       ".maintain/docs-index-tpl.ejs"
   # Where the `/latest` symbolic link links to. One of the $RUSTDOCS_DEPLOY_REFS value.
@@ -161,6 +161,7 @@ default:
 
 .gen-rustdoc-rules:                &gen-rustdoc-rules
   rules:
+    # TODO: remove the PR number
     - if: $CI_COMMIT_REF_NAME =~ /^[0-9]+$/
     - if: $CI_PIPELINE_SOURCE == "pipeline"
       when: never
@@ -172,6 +173,7 @@ default:
 .regen-all-rustdoc-rules:          &regen-all-rustdoc-rules
   rules:
     # Will only run if manually triggered on web with $REPUBLISH_ALL_RUSTDOCS set to true
+    # TODO: remove the PR number
     - if: $CI_COMMIT_REF_NAME =~ /^[0-9]+$/
     - if: $CI_PIPELINE_SOURCE == "web" && $REPUBLISH_ALL_RUSTDOCS == "true"
 
@@ -217,6 +219,13 @@ default:
   # Install `ejs` and generate index.html based on RUSTDOCS_DEPLOY_REFS
   - yarn global add ejs
   - 'ejs ${INDEX_TPL} -i "{\"deploy_refs\":\"${RUSTDOCS_DEPLOY_REFS}\",\"repo_name\":\"${CI_PROJECT_NAME}\",\"latest\":\"${LATEST}\"}" > /tmp/index.html'
+
+.cargo-doc-script:                 &cargo-doc-script
+  # FIXME: it fails with `RUSTDOCFLAGS="-Dwarnings"`
+  # Try to run with nightly rustc first. If failed, when use the stable rustc.
+  - RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html" &&
+    (time cargo +nightly doc --no-deps --workspace --all-features --verbose ||
+    time cargo doc --no-deps --workspace --all-features --verbose)
 
 #### Vault secrets
 .vault-secrets:                    &vault-secrets
@@ -667,10 +676,9 @@ build-rustdoc:
     paths:
       - ./crate-docs/
   script:
-    - '[[ " ${RUSTDOCS_DEPLOY_REFS} " =~ " ${CI_COMMIT_REF_NAME} " ]] || exit 0'
-    # FIXME: it fails with `RUSTDOCFLAGS="-Dwarnings"`
-    - RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html"
-        time cargo doc --no-deps --workspace --all-features --verbose
+    # TODO
+    # - '[[ " ${RUSTDOCS_DEPLOY_REFS} " =~ " ${CI_COMMIT_REF_NAME} " ]] || exit 0'
+    - *cargo-doc-script
     - rm -f ./target/doc/.lock
     - mv ./target/doc ./crate-docs
     # FIXME: remove me after CI image gets nonroot
@@ -699,8 +707,9 @@ rebuild-all-rustdoc:
     - DEPLOY_ARR=($RUSTDOCS_DEPLOY_REFS)
     - for REF in "${DEPLOY_ARR[@]}"; do
         git checkout $REF || (echo "${REF} not existed in remote." && continue);
-        RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html"
-          time cargo doc --no-deps --workspace --all-features --verbose;
+        RUSTDOCFLAGS="--html-in-header $(pwd)/.maintain/rustdoc-header.html" &&
+          (time cargo +nightly doc --no-deps --workspace --all-features --verbose ||
+          time cargo doc --no-deps --workspace --all-features --verbose);
         rm -f ./target/doc/.lock;
         mv target/doc crate-docs/${REF};
         echo "<meta http-equiv=refresh content=0;url=${DOC_INDEX_PAGE}>" > ./crate-docs/${REF}/index.html;
@@ -818,7 +827,9 @@ publish-rustdoc:
     # exit immediately.
     # Putting spaces at the front and back to ensure we are not matching just any substring, but the
     # whole space-separated value.
-    - '[[ " ${RUSTDOCS_DEPLOY_REFS} " =~ " ${CI_COMMIT_REF_NAME} " ]] || exit 0'
+
+    # TODO
+    # - '[[ " ${RUSTDOCS_DEPLOY_REFS} " =~ " ${CI_COMMIT_REF_NAME} " ]] || exit 0'
     - rm -rf /tmp/*
     - *reset-gh-info-script
     - *gen-index-script
